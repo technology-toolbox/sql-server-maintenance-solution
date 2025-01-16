@@ -53,7 +53,7 @@ BEGIN
   --// Source:  https://ola.hallengren.com                                                        //--
   --// License: https://ola.hallengren.com/license.html                                           //--
   --// GitHub:  https://github.com/olahallengren/sql-server-maintenance-solution                  //--
-  --// Version: 2020-12-31 18:58:56                                                               //--
+  --// Version: 2025-01-15 19:00:39                                                               //--
   ----------------------------------------------------------------------------------------------------
 
   SET NOCOUNT ON
@@ -93,7 +93,6 @@ BEGIN
   DECLARE @CurrentInStandby bit
   DECLARE @CurrentRecoveryModel nvarchar(max)
 
-  DECLARE @CurrentIsDatabaseAccessible bit
   DECLARE @CurrentReplicaID uniqueidentifier
   DECLARE @CurrentAvailabilityGroupID uniqueidentifier
   DECLARE @CurrentAvailabilityGroup nvarchar(max)
@@ -140,8 +139,10 @@ BEGIN
   DECLARE @CurrentIsFileStream bit
   DECLARE @CurrentIsColumnStore bit
   DECLARE @CurrentIsComputed bit
+  DECLARE @CurrentIsClusteredIndexComputed bit
   DECLARE @CurrentIsTimestamp bit
   DECLARE @CurrentAllowPageLocks bit
+  DECLARE @CurrentHasFilter bit
   DECLARE @CurrentNoRecompute bit
   DECLARE @CurrentIsIncremental bit
   DECLARE @CurrentRowCount bigint
@@ -188,11 +189,13 @@ BEGIN
                                        IndexName nvarchar(max),
                                        IndexType int,
                                        AllowPageLocks bit,
+                                       HasFilter bit,
                                        IsImageText bit,
                                        IsNewLOB bit,
                                        IsFileStream bit,
                                        IsColumnStore bit,
                                        IsComputed bit,
+                                       IsClusteredIndexComputed bit,
                                        IsTimestamp bit,
                                        OnReadOnlyFileGroup bit,
                                        ResumableIndexOperation bit,
@@ -521,7 +524,7 @@ BEGIN
               GROUP BY tmpDatabases.DatabaseName) SelectedDatabases2
   ON tmpDatabases.DatabaseName = SelectedDatabases2.DatabaseName
 
-  IF @Databases IS NOT NULL AND (NOT EXISTS(SELECT * FROM @SelectedDatabases) OR EXISTS(SELECT * FROM @SelectedDatabases WHERE DatabaseName IS NULL OR DatabaseName = ''))
+  IF @Databases IS NOT NULL AND (NOT EXISTS(SELECT * FROM @SelectedDatabases) OR EXISTS(SELECT * FROM @SelectedDatabases WHERE DatabaseName IS NULL OR DATALENGTH(DatabaseName) = 0))
   BEGIN
     INSERT INTO @Errors ([Message], Severity, [State])
     SELECT 'The value for the parameter @Databases is not supported.', 16, 1
@@ -1471,18 +1474,6 @@ BEGIN
       RAISERROR('%s',10,1,@DatabaseMessage) WITH NOWAIT
     END
 
-    IF @CurrentDatabaseState = 'ONLINE' AND SERVERPROPERTY('EngineEdition') <> 5
-    BEGIN
-      IF EXISTS (SELECT * FROM sys.database_recovery_status WHERE database_id = DB_ID(@CurrentDatabaseName) AND database_guid IS NOT NULL)
-      BEGIN
-        SET @CurrentIsDatabaseAccessible = 1
-      END
-      ELSE
-      BEGIN
-        SET @CurrentIsDatabaseAccessible = 0
-      END
-    END
-
     IF @Version >= 11 AND SERVERPROPERTY('IsHadrEnabled') = 1
     BEGIN
       SELECT @CurrentReplicaID = databases.replica_id
@@ -1510,12 +1501,6 @@ BEGIN
       WHERE database_id = DB_ID(@CurrentDatabaseName)
     END
 
-    IF @CurrentIsDatabaseAccessible IS NOT NULL
-    BEGIN
-      SET @DatabaseMessage = 'Is accessible: ' + CASE WHEN @CurrentIsDatabaseAccessible = 1 THEN 'Yes' ELSE 'No' END
-      RAISERROR('%s',10,1,@DatabaseMessage) WITH NOWAIT
-    END
-
     IF @CurrentAvailabilityGroup IS NOT NULL
     BEGIN
       SET @DatabaseMessage = 'Availability group: ' + ISNULL(@CurrentAvailabilityGroup,'N/A')
@@ -1541,8 +1526,9 @@ BEGIN
     END
 
     IF @CurrentDatabaseState = 'ONLINE'
-    AND NOT (@CurrentUserAccess = 'SINGLE_USER' AND @CurrentIsDatabaseAccessible = 0)
-    AND DATABASEPROPERTYEX(@CurrentDatabaseName,'Updateability') = 'READ_WRITE'
+    AND NOT (@CurrentUserAccess = 'SINGLE_USER')
+    AND NOT (@CurrentAvailabilityGroup IS NOT NULL AND (@CurrentAvailabilityGroupRole <> 'PRIMARY' OR @CurrentAvailabilityGroupRole IS NULL))
+    AND NOT (@CurrentIsReadOnly = 1)
     AND (@CurrentExecuteAsUserExists = 1 OR @CurrentExecuteAsUserExists IS NULL)
     BEGIN
 
@@ -1550,7 +1536,7 @@ BEGIN
       IF (EXISTS(SELECT * FROM @ActionsPreferred) OR @UpdateStatistics IS NOT NULL) AND (SYSDATETIME() < DATEADD(SECOND,@TimeLimit,@StartTime) OR @TimeLimit IS NULL)
       BEGIN
         SET @CurrentCommand = 'SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;'
-                              + ' SELECT SchemaID, SchemaName, ObjectID, ObjectName, ObjectType, IsMemoryOptimized, IndexID, IndexName, IndexType, AllowPageLocks, IsImageText, IsNewLOB, IsFileStream, IsColumnStore, IsComputed, IsTimestamp, OnReadOnlyFileGroup, ResumableIndexOperation, StatisticsID, StatisticsName, NoRecompute, IsIncremental, PartitionID, PartitionNumber, PartitionCount, [Order], Selected, Completed'
+                              + ' SELECT SchemaID, SchemaName, ObjectID, ObjectName, ObjectType, IsMemoryOptimized, IndexID, IndexName, IndexType, AllowPageLocks, HasFilter, IsImageText, IsNewLOB, IsFileStream, IsColumnStore, IsComputed, IsClusteredIndexComputed, IsTimestamp, OnReadOnlyFileGroup, ResumableIndexOperation, StatisticsID, StatisticsName, NoRecompute, IsIncremental, PartitionID, PartitionNumber, PartitionCount, [Order], Selected, Completed'
                               + ' FROM ('
 
         IF EXISTS(SELECT * FROM @ActionsPreferred) OR @UpdateStatistics IN('ALL','INDEX')
@@ -1565,6 +1551,7 @@ BEGIN
                                                     + ', indexes.[name] AS IndexName'
                                                     + ', indexes.[type] AS IndexType'
                                                     + ', indexes.allow_page_locks AS AllowPageLocks'
+                                                    + ', indexes.has_filter AS HasFilter'
 
                                                     + ', CASE WHEN indexes.[type] = 1 AND EXISTS(SELECT * FROM sys.columns columns INNER JOIN sys.types types ON columns.system_type_id = types.user_type_id WHERE columns.[object_id] = objects.object_id AND types.name IN(''image'',''text'',''ntext'')) THEN 1 ELSE 0 END AS IsImageText'
 
@@ -1577,13 +1564,15 @@ BEGIN
 
                                                     + ', CASE WHEN EXISTS(SELECT * FROM sys.index_columns index_columns INNER JOIN sys.columns columns ON index_columns.object_id = columns.object_id AND index_columns.column_id = columns.column_id WHERE (index_columns.key_ordinal > 0 OR index_columns.partition_ordinal > 0) AND columns.is_computed = 1 AND index_columns.object_id = indexes.object_id AND index_columns.index_id = indexes.index_id) THEN 1 ELSE 0 END AS IsComputed'
 
+                                                    + ', CASE WHEN EXISTS(SELECT * FROM sys.index_columns index_columns INNER JOIN sys.columns columns ON index_columns.object_id = columns.object_id AND index_columns.column_id = columns.column_id INNER JOIN sys.indexes indexes2 ON index_columns.object_id = indexes2.object_id AND index_columns.index_id = indexes2.index_id WHERE (index_columns.key_ordinal > 0 OR index_columns.partition_ordinal > 0) AND columns.is_computed = 1 AND indexes2.[type] = 1 AND index_columns.object_id = indexes.object_id) THEN 1 ELSE 0 END AS IsClusteredIndexComputed'
+
                                                     + ', CASE WHEN EXISTS(SELECT * FROM sys.index_columns index_columns INNER JOIN sys.columns columns ON index_columns.[object_id] = columns.[object_id] AND index_columns.column_id = columns.column_id INNER JOIN sys.types types ON columns.system_type_id = types.system_type_id WHERE index_columns.[object_id] = objects.object_id AND index_columns.index_id = indexes.index_id AND types.[name] = ''timestamp'') THEN 1 ELSE 0 END AS IsTimestamp'
 
                                                     + ', CASE WHEN EXISTS (SELECT * FROM sys.indexes indexes2 INNER JOIN sys.destination_data_spaces destination_data_spaces ON indexes.data_space_id = destination_data_spaces.partition_scheme_id INNER JOIN sys.filegroups filegroups ON destination_data_spaces.data_space_id = filegroups.data_space_id WHERE filegroups.is_read_only = 1 AND indexes2.[object_id] = indexes.[object_id] AND indexes2.[index_id] = indexes.index_id' + CASE WHEN @PartitionLevel = 'Y' THEN ' AND destination_data_spaces.destination_id = partitions.partition_number' ELSE '' END + ') THEN 1'
                                                     + ' WHEN EXISTS (SELECT * FROM sys.indexes indexes2 INNER JOIN sys.filegroups filegroups ON indexes.data_space_id = filegroups.data_space_id WHERE filegroups.is_read_only = 1 AND indexes.[object_id] = indexes2.[object_id] AND indexes.[index_id] = indexes2.index_id) THEN 1'
                                                     + ' WHEN indexes.[type] = 1 AND EXISTS (SELECT * FROM sys.tables tables INNER JOIN sys.filegroups filegroups ON tables.lob_data_space_id = filegroups.data_space_id WHERE filegroups.is_read_only = 1 AND tables.[object_id] = objects.[object_id]) THEN 1 ELSE 0 END AS OnReadOnlyFileGroup'
 
-                                                    + ', ' + CASE WHEN @Version >= 14 THEN 'CASE WHEN EXISTS(SELECT * FROM sys.index_resumable_operations index_resumable_operations WHERE state_desc = ''PAUSED'' AND index_resumable_operations.object_id = indexes.object_id AND index_resumable_operations.index_id = indexes.index_id AND (index_resumable_operations.partition_number = partitions.partition_number OR index_resumable_operations.partition_number IS NULL)) THEN 1 ELSE 0 END' ELSE '0' END + ' AS ResumableIndexOperation'
+                                                    + ', ' + CASE WHEN @Version >= 14 THEN 'CASE WHEN EXISTS(SELECT * FROM sys.index_resumable_operations index_resumable_operations WHERE state_desc = ''PAUSED'' AND index_resumable_operations.object_id = indexes.object_id AND index_resumable_operations.index_id = indexes.index_id' + CASE WHEN @PartitionLevel = 'Y' THEN ' AND (index_resumable_operations.partition_number = partitions.partition_number OR index_resumable_operations.partition_number IS NULL)' ELSE '' END + ') THEN 1 ELSE 0 END' ELSE '0' END + ' AS ResumableIndexOperation'
 
                                                     + ', stats.stats_id AS StatisticsID'
                                                     + ', stats.name AS StatisticsName'
@@ -1628,11 +1617,13 @@ BEGIN
                                                     + ', NULL AS IndexID, NULL AS IndexName'
                                                     + ', NULL AS IndexType'
                                                     + ', NULL AS AllowPageLocks'
+                                                    + ', NULL AS HasFilter'
                                                     + ', NULL AS IsImageText'
                                                     + ', NULL AS IsNewLOB'
                                                     + ', NULL AS IsFileStream'
                                                     + ', NULL AS IsColumnStore'
                                                     + ', NULL AS IsComputed'
+                                                    + ', NULL AS IsClusteredIndexComputed'
                                                     + ', NULL AS IsTimestamp'
                                                     + ', NULL AS OnReadOnlyFileGroup'
                                                     + ', NULL AS ResumableIndexOperation'
@@ -1663,7 +1654,7 @@ BEGIN
 
         SET @CurrentCommand = @CurrentCommand + ') IndexesStatistics'
 
-        INSERT INTO @tmpIndexesStatistics (SchemaID, SchemaName, ObjectID, ObjectName, ObjectType, IsMemoryOptimized, IndexID, IndexName, IndexType, AllowPageLocks, IsImageText, IsNewLOB, IsFileStream, IsColumnStore, IsComputed, IsTimestamp, OnReadOnlyFileGroup, ResumableIndexOperation, StatisticsID, StatisticsName, [NoRecompute], IsIncremental, PartitionID, PartitionNumber, PartitionCount, [Order], Selected, Completed)
+        INSERT INTO @tmpIndexesStatistics (SchemaID, SchemaName, ObjectID, ObjectName, ObjectType, IsMemoryOptimized, IndexID, IndexName, IndexType, AllowPageLocks, HasFilter, IsImageText, IsNewLOB, IsFileStream, IsColumnStore, IsComputed, IsClusteredIndexComputed, IsTimestamp, OnReadOnlyFileGroup, ResumableIndexOperation, StatisticsID, StatisticsName, [NoRecompute], IsIncremental, PartitionID, PartitionNumber, PartitionCount, [Order], Selected, Completed)
         EXECUTE @CurrentDatabase_sp_executesql @stmt = @CurrentCommand
         SET @Error = @@ERROR
         IF @Error <> 0
@@ -1763,11 +1754,13 @@ BEGIN
                      @CurrentIndexName = IndexName,
                      @CurrentIndexType = IndexType,
                      @CurrentAllowPageLocks = AllowPageLocks,
+                     @CurrentHasFilter = HasFilter,
                      @CurrentIsImageText = IsImageText,
                      @CurrentIsNewLOB = IsNewLOB,
                      @CurrentIsFileStream = IsFileStream,
                      @CurrentIsColumnStore = IsColumnStore,
                      @CurrentIsComputed = IsComputed,
+                     @CurrentIsClusteredIndexComputed = IsClusteredIndexComputed,
                      @CurrentIsTimestamp = IsTimestamp,
                      @CurrentOnReadOnlyFileGroup = OnReadOnlyFileGroup,
                      @CurrentResumableIndexOperation = ResumableIndexOperation,
@@ -1905,6 +1898,7 @@ BEGIN
         AND @CurrentOnReadOnlyFileGroup = 0
         AND EXISTS(SELECT * FROM @ActionsPreferred)
         AND (EXISTS(SELECT [Priority], [Action], COUNT(*) FROM @ActionsPreferred GROUP BY [Priority], [Action] HAVING COUNT(*) <> 3) OR @MinNumberOfPages > 0 OR @MaxNumberOfPages IS NOT NULL)
+        AND NOT (SERVERPROPERTY('EngineEdition') = 8 AND @CurrentDatabaseName = 'master')
         BEGIN
           SET @CurrentCommand = ''
 
@@ -2051,7 +2045,9 @@ BEGIN
           SET @CurrentComment += 'FileStream: ' + CASE WHEN @CurrentIsFileStream = 1 THEN 'Yes' WHEN @CurrentIsFileStream = 0 THEN 'No' ELSE 'N/A' END + ', '
           IF @Version >= 11 SET @CurrentComment += 'ColumnStore: ' + CASE WHEN @CurrentIsColumnStore = 1 THEN 'Yes' WHEN @CurrentIsColumnStore = 0 THEN 'No' ELSE 'N/A' END + ', '
           IF @Version >= 14 AND @Resumable = 'Y' SET @CurrentComment += 'Computed: ' + CASE WHEN @CurrentIsComputed = 1 THEN 'Yes' WHEN @CurrentIsComputed = 0 THEN 'No' ELSE 'N/A' END + ', '
+          IF @Version >= 14 AND @Resumable = 'Y' AND @CurrentIndexType = 2 SET @CurrentComment += 'ClusteredIndexComputed: ' + CASE WHEN @CurrentIsClusteredIndexComputed = 1 THEN 'Yes' WHEN @CurrentIsClusteredIndexComputed = 0 THEN 'No' ELSE 'N/A' END + ', '
           IF @Version >= 14 AND @Resumable = 'Y' SET @CurrentComment += 'Timestamp: ' + CASE WHEN @CurrentIsTimestamp = 1 THEN 'Yes' WHEN @CurrentIsTimestamp = 0 THEN 'No' ELSE 'N/A' END + ', '
+          IF @Version >= 14 AND @Resumable = 'Y' SET @CurrentComment += 'HasFilter: ' + CASE WHEN @CurrentHasFilter = 1 THEN 'Yes' WHEN @CurrentHasFilter = 0 THEN 'No' ELSE 'N/A' END + ', '
           SET @CurrentComment += 'AllowPageLocks: ' + CASE WHEN @CurrentAllowPageLocks = 1 THEN 'Yes' WHEN @CurrentAllowPageLocks = 0 THEN 'No' ELSE 'N/A' END + ', '
           SET @CurrentComment += 'PageCount: ' + ISNULL(CAST(@CurrentPageCount AS nvarchar),'N/A') + ', '
           SET @CurrentComment += 'Fragmentation: ' + ISNULL(CAST(@CurrentFragmentationLevel AS nvarchar),'N/A')
@@ -2124,10 +2120,10 @@ BEGIN
           IF (@Version >= 14 OR SERVERPROPERTY('EngineEdition') IN (5,8)) AND @CurrentAction = 'INDEX_REBUILD_ONLINE' AND @CurrentResumableIndexOperation = 0
           BEGIN
             INSERT INTO @CurrentAlterIndexWithClauseArguments (Argument)
-            SELECT CASE WHEN @Resumable = 'Y' AND @CurrentIndexType IN(1,2) AND @CurrentIsComputed = 0 AND @CurrentIsTimestamp = 0 THEN 'RESUMABLE = ON' ELSE 'RESUMABLE = OFF' END
+            SELECT CASE WHEN @Resumable = 'Y' AND @CurrentIndexType IN(1,2) AND @CurrentIsComputed = 0 AND @CurrentIsClusteredIndexComputed = 0 AND @CurrentIsTimestamp = 0 AND @CurrentHasFilter = 0 THEN 'RESUMABLE = ON' ELSE 'RESUMABLE = OFF' END
           END
 
-          IF (@Version >= 14 OR SERVERPROPERTY('EngineEdition') IN (5,8)) AND @CurrentAction = 'INDEX_REBUILD_ONLINE' AND @CurrentResumableIndexOperation = 0 AND @Resumable = 'Y'  AND @CurrentIndexType IN(1,2) AND @CurrentIsComputed = 0 AND @CurrentIsTimestamp = 0 AND @TimeLimit IS NOT NULL
+          IF (@Version >= 14 OR SERVERPROPERTY('EngineEdition') IN (5,8)) AND @CurrentAction = 'INDEX_REBUILD_ONLINE' AND @CurrentResumableIndexOperation = 0 AND @Resumable = 'Y'  AND @CurrentIndexType IN(1,2) AND @CurrentIsComputed = 0 AND @CurrentIsClusteredIndexComputed = 0 AND @CurrentIsTimestamp = 0 AND @CurrentHasFilter = 0 AND @TimeLimit IS NOT NULL
           BEGIN
             INSERT INTO @CurrentAlterIndexWithClauseArguments (Argument)
             SELECT 'MAX_DURATION = ' + CAST(DATEDIFF(MINUTE,SYSDATETIME(),DATEADD(SECOND,@TimeLimit,@StartTime)) AS nvarchar(max))
@@ -2239,16 +2235,16 @@ BEGIN
             SELECT 'SAMPLE ' + CAST(@CurrentStatisticsSample AS nvarchar) + ' PERCENT'
           END
 
-          IF @CurrentStatisticsResample = 'Y'
-          BEGIN
-            INSERT INTO @CurrentUpdateStatisticsWithClauseArguments (Argument)
-            SELECT 'RESAMPLE'
-          END
-
           IF @CurrentNoRecompute = 1
           BEGIN
             INSERT INTO @CurrentUpdateStatisticsWithClauseArguments (Argument)
             SELECT 'NORECOMPUTE'
+          END
+
+          IF @CurrentStatisticsResample = 'Y'
+          BEGIN
+            INSERT INTO @CurrentUpdateStatisticsWithClauseArguments (Argument)
+            SELECT 'RESAMPLE'
           END
 
           IF EXISTS (SELECT * FROM @CurrentUpdateStatisticsWithClauseArguments)
@@ -2331,8 +2327,10 @@ BEGIN
         SET @CurrentIsFileStream = NULL
         SET @CurrentIsColumnStore = NULL
         SET @CurrentIsComputed = NULL
+        SET @CurrentIsClusteredIndexComputed = NULL
         SET @CurrentIsTimestamp = NULL
         SET @CurrentAllowPageLocks = NULL
+        SET @CurrentHasFilter = NULL
         SET @CurrentNoRecompute = NULL
         SET @CurrentIsIncremental = NULL
         SET @CurrentRowCount = NULL
@@ -2400,7 +2398,6 @@ BEGIN
     SET @CurrentInStandby = NULL
     SET @CurrentRecoveryModel = NULL
 
-    SET @CurrentIsDatabaseAccessible = NULL
     SET @CurrentReplicaID = NULL
     SET @CurrentAvailabilityGroupID = NULL
     SET @CurrentAvailabilityGroup = NULL
